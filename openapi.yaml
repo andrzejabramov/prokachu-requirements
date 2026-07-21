@@ -1,0 +1,324 @@
+openapi: 3.0.3
+info:
+  title: Прокачу API
+  description: |
+    API для мобильного приложения сервиса аренды велосипедов «Прокачу».
+
+    **Ключевые особенности:**
+    - Интеграция с Bluetooth-замками через BLE-команды
+    - Автоматическое завершение аренды по геолокации
+    - Соответствие PCI DSS (данные карт не хранятся на серверах)
+    - Геозонирование: только в пределах МКАД, 06:00–23:00
+  version: 1.0.0
+  contact:
+    name: Прокачу Tech Team
+    email: tech@prokachu.ru
+
+servers:
+  - url: https://api.prokachu.ru/v1
+    description: Production
+  - url: https://api-staging.prokachu.ru/v1
+    description: Staging
+
+paths:
+  /stations:
+    get:
+      summary: Получить список станций с доступными велосипедами
+      description: |
+        Возвращает все активные станции с координатами и количеством свободных велосипедов.
+        Используется для отображения интерактивной карты в приложении.
+      tags:
+        - Stations
+      parameters:
+        - name: lat
+          in: query
+          description: Широта пользователя (для сортировки по расстоянию)
+          schema:
+            type: number
+            format: double
+            example: 55.7558
+        - name: lng
+          in: query
+          description: Долгота пользователя
+          schema:
+            type: number
+            format: double
+            example: 37.6173
+        - name: radius_km
+          in: query
+          description: Радиус поиска (км)
+          schema:
+            type: integer
+            default: 5
+            example: 3
+      responses:
+        "200":
+          description: Список станций
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Station"
+        "400":
+          description: Некорректные координаты (за пределами МКАД)
+        "503":
+          description: Сервис временно недоступен
+
+  /rentals/start:
+    post:
+      summary: Начать аренду (разблокировать велосипед)
+      description: |
+        Инициирует разблокировку Bluetooth-замка велосипеда.
+
+        **Бизнес-логика:**
+        1. Проверяет, что бронь активна и не истекла
+        2. Проверяет, что пользователь находится в зоне станции (радиус 50м)
+        3. Проверяет, что текущее время в диапазоне 06:00–23:00
+        4. Отправляет команду разблокировки на замок через BLE
+        5. Создает запись аренды со статусом ACTIVE
+        6. Возвращает токен для резервной разблокировки через QR-код
+      tags:
+        - Rentals
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - booking_id
+                - location
+              properties:
+                booking_id:
+                  type: string
+                  format: uuid
+                  description: ID активной брони
+                  example: "550e8400-e29b-41d4-a716-446655440000"
+                location:
+                  $ref: "#/components/schemas/Location"
+      responses:
+        "201":
+          description: Аренда успешно начата
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RentalStartResponse"
+        "400":
+          description: Бронь истекла или не найдена
+        "403":
+          description: Пользователь не в зоне станции или вне рабочего времени
+        "409":
+          description: Велосипед уже в аренде или неисправен
+        "502":
+          description: Ошибка связи с Bluetooth-замком
+      callbacks:
+        rentalStatusChanged:
+          "{$request.body#/webhook_url}":
+            post:
+              summary: Уведомление об изменении статуса аренды
+              requestBody:
+                content:
+                  application/json:
+                    schema:
+                      $ref: "#/components/schemas/RentalStatusEvent"
+              responses:
+                "200":
+                  description: Уведомление получено
+
+  /rentals/{rental_id}/finish:
+    post:
+      summary: Завершить аренду (возврат на станцию)
+      description: |
+        Завершает аренду и инициирует списание средств.
+
+        **Бизнес-логика:**
+        1. Проверяет, что геолокация пользователя в радиусе 20м от станции
+        2. Отправляет команду блокировки на замок
+        3. Рассчитывает стоимость по тарифу (150 руб/час или 800 руб/сутки)
+        4. Списывает средства через платежный шлюз (PCI DSS)
+        5. Обновляет статус аренды на COMPLETED
+        6. Отправляет чек на email и Push-уведомление
+      tags:
+        - Rentals
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: rental_id
+          in: path
+          required: true
+          description: ID активной аренды
+          schema:
+            type: string
+            format: uuid
+            example: "550e8400-e29b-41d4-a716-446655440001"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - location
+              properties:
+                location:
+                  $ref: "#/components/schemas/Location"
+                force:
+                  type: boolean
+                  default: false
+                  description: Принудительное завершение (для операторов)
+      responses:
+        "200":
+          description: Аренда успешно завершена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RentalFinishResponse"
+        "400":
+          description: Пользователь не в зоне станции (расстояние > 20м)
+        "404":
+          description: Аренда не найдена или уже завершена
+        "402":
+          description: Ошибка списания средств (недостаточно баланса)
+        "502":
+          description: Ошибка связи с платежным шлюзом или замком
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT-токен, полученный после авторизации по телефону
+
+  schemas:
+    Location:
+      type: object
+      required:
+        - lat
+        - lng
+      properties:
+        lat:
+          type: number
+          format: double
+          description: Широта
+          example: 55.7558
+        lng:
+          type: number
+          format: double
+          description: Долгота
+          example: 37.6173
+        accuracy:
+          type: number
+          description: Точность GPS (метры)
+          example: 10
+
+    Station:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "station-001"
+        name:
+          type: string
+          example: "Парк Горького, главный вход"
+        location:
+          $ref: "#/components/schemas/Location"
+        available_bikes:
+          type: integer
+          description: Количество свободных велосипедов
+          example: 5
+        total_capacity:
+          type: integer
+          description: Общая вместимость станции
+          example: 10
+        distance_km:
+          type: number
+          description: Расстояние от пользователя (если переданы координаты)
+          example: 0.45
+
+    RentalStartResponse:
+      type: object
+      properties:
+        rental_id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440001"
+        bike_id:
+          type: string
+          example: "bike-123"
+        started_at:
+          type: string
+          format: date-time
+          example: "2026-07-19T14:30:00Z"
+        tariff:
+          type: string
+          enum: [hourly, daily]
+          example: "hourly"
+        rate_per_hour:
+          type: number
+          example: 150.00
+        unlock_token:
+          type: string
+          description: Токен для резервной разблокировки через QR-код (если Bluetooth не сработал)
+          example: "qr-token-abc123"
+        ble_command:
+          type: object
+          description: Команда для отправки на Bluetooth-замок
+          properties:
+            command:
+              type: string
+              example: "UNLOCK"
+            payload:
+              type: string
+              example: "base64-encoded-payload"
+
+    RentalFinishResponse:
+      type: object
+      properties:
+        rental_id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440001"
+        finished_at:
+          type: string
+          format: date-time
+          example: "2026-07-19T15:45:00Z"
+        duration_minutes:
+          type: integer
+          example: 75
+        total_amount:
+          type: number
+          description: Итоговая стоимость (руб)
+          example: 187.50
+        transaction_id:
+          type: string
+          description: ID транзакции в платежном шлюзе
+          example: "txn-xyz789"
+        receipt_url:
+          type: string
+          format: uri
+          description: Ссылка на PDF-чек
+          example: "https://receipts.prokachu.ru/txn-xyz789.pdf"
+
+    RentalStatusEvent:
+      type: object
+      properties:
+        event_type:
+          type: string
+          enum: [started, finished, force_finished, incident_reported]
+        rental_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        data:
+          type: object
+          description: Дополнительные данные (зависят от типа события)
