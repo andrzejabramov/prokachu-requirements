@@ -27,6 +27,6 @@ _(Здесь будет встроен фрейм Figma. Инструкцию п
 
 ---
 
-**Исполнитель:** Андрей Абрамов  
+**Исполнитель:** Оксана Абрамова  
 **Дата:** 19 июля 2026 г.  
-**Репозиторий:** [prokachu-requirements](https://github.com/ТВОЙ_ЛОГИН/prokachu-requirements)
+**Репозиторий:** [prokachu-requirements](https://github.com/ksiu999/procachu)
